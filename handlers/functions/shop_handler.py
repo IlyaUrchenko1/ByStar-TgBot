@@ -1,169 +1,210 @@
-from decimal import Decimal
-import logging
-from aiogram import Router, F, types
+from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import Command
-import requests
-from datetime import datetime, timedelta
-import os
-from dotenv import load_dotenv
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+from utils.constants import STAR_TO_RUBLE, ADMIN_IDS
+from utils.database import Database
 
-load_dotenv()
+router = Router(name='shop')
+db = Database()
 
-router = Router()
-logger = logging.getLogger(__name__)
+class ShopStates(StatesGroup):
+    waiting_for_stars = State()
+    waiting_for_payment = State()
 
-CRYPTOCLOUD_API_URL = "https://api.cryptocloud.plus/v2/invoice/create"
-API_KEY = os.getenv("API_KEY")
-SHOP_ID = os.getenv("SHOP_ID")
+PAYMENT_DETAILS = """
+Реквизиты для оплаты:
 
-STAR_PRICES = {
-    "1": 5,      # 5 USD за 1 звезду
-    "5": 20,     # 20 USD за 5 звезд  
-    "10": 35,    # 35 USD за 10 звезд
-    "20": 60     # 60 USD за 20 звезд
-}
+РФ 🇷🇺💸 
+₽ 2200700636880774
+€ 2200701918386050
+
+Armenia 🇦🇲
+$ 4083060021344367
+€ 4083060031125483
+
+Kazakhstan 🇰🇿
+₸ 5269880009919101
+"""
 
 @router.callback_query(F.data == "buy_stars")
-async def show_star_packages(callback: types.CallbackQuery):
-    """Показывает доступные пакеты звезд для покупки"""
-    await callback.answer()
-    
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
+async def start_buy_stars(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        await callback.message.answer("Введите количество звезд, которое хотите купить:")
+        await state.set_state(ShopStates.waiting_for_stars)
+    except Exception as e:
+        print(f"Error in start_buy_stars: {e}")
+        await callback.message.answer("Произошла ошибка. Попробуйте позже.")
+
+@router.message(ShopStates.waiting_for_stars)
+async def process_stars_amount(message: Message, state: FSMContext):
+    try:
+        stars = int(message.text)
+        if stars <= 0:
+            await message.answer("Пожалуйста, введите положительное число звезд.")
+            return
+            
+        rubles = round(stars * STAR_TO_RUBLE, 2)
+        
+        await state.update_data(stars=stars, rubles=rubles)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Проверить оплату ✅", callback_data="check_payment")]
+        ])
+        
+        await message.answer(
+            f"Сумма к оплате: {rubles} RUB\n\n{PAYMENT_DETAILS}\n\n"
+            f"После оплаты нажмите кнопку «Проверить оплату»",
+            reply_markup=keyboard
+        )
+        await state.set_state(ShopStates.waiting_for_payment)
+        
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректное число звезд.")
+    except Exception as e:
+        print(f"Error in process_stars_amount: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+@router.callback_query(ShopStates.waiting_for_payment, F.data == "check_payment")
+async def check_payment(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        
+        data = await state.get_data()
+        stars = data.get('stars')
+        rubles = data.get('rubles')
+        
+        if not stars or not rubles:
+            await callback.message.answer("Произошла ошибка. Начните покупку заново.")
+            await state.clear()
+            return
+            
+        user_id = str(callback.from_user.id)
+        user = db.get_user(user_id)
+        
+        if not user:
+            await callback.message.answer("Пользователь не найден. Пожалуйста, перезапустите бота.")
+            await state.clear()
+            return
+            
+        order_id = db.create_order(user['id'], stars, rubles, "pending")
+        
+        admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
-                types.InlineKeyboardButton(text=f"⭐ x{stars} - ${price}", 
-                                         callback_data=f"buy_stars:{stars}")
-            ] for stars, price in STAR_PRICES.items()
-        ]
-    )
-    
-    await callback.message.answer(
-        "🌟 Выберите количество звезд для покупки:\n\n"
-        "Все платежи безопасно обрабатываются через @CryptoCloud Plus",
-        reply_markup=keyboard
-    )
-
-@router.callback_query(F.data.startswith("buy_stars:"))
-async def process_buy_stars(callback: types.CallbackQuery, state: FSMContext):
-    """Обрабатывает выбор пакета звезд и создает счет для оплаты"""
-    stars = callback.data.split(":")[1]
-    amount = STAR_PRICES[stars]
-    
-    try:
-        headers = {
-            "Authorization": f"Token {API_KEY}",
-            "Content-Type": "application/json"
-        }
+                InlineKeyboardButton(text="Принять ✅", callback_data=f"approve_payment_{order_id}"),
+                InlineKeyboardButton(text="Отклонить ❌", callback_data=f"reject_payment_{order_id}")
+            ],
+            [InlineKeyboardButton(text="Открыть профиль 👤", url=f"tg://user?id={user_id}")]
+        ])
         
-        data = {
-            "shop_id": SHOP_ID,
-            "amount": str(amount),
-            "currency": "USD",
-            "order_id": f"stars_{callback.from_user.id}_{int(datetime.now().timestamp())}",
-            "description": f"Покупка {stars} звезд",
-            "lang": "ru"
-        }
+        admin_message = (
+            f"🔔 Новая заявка на покупку звезд!\n\n"
+            f"От: {callback.from_user.mention_html()}\n"
+            f"ID: {user_id}\n"
+            f"Звезд: {stars}\n"
+            f"Сумма: {rubles} RUB"
+        )
         
-        response = requests.post(CRYPTOCLOUD_API_URL, headers=headers, json=data)
-        response.raise_for_status()
-        result = response.json()
+        for admin_id in ADMIN_IDS:
+            try:
+                await callback.bot.send_message(
+                    admin_id,
+                    admin_message,
+                    reply_markup=admin_keyboard,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Failed to notify admin {admin_id}: {e}")
         
-        if result.get("status") == "success" and result.get("result"):
-            payment_data = result["result"]
-            payment_link = payment_data["link"]
-            payment_uuid = payment_data["uuid"]
-            expiry_date = datetime.strptime(payment_data["expiry_date"], "%Y-%m-%d %H:%M:%S.%f")
-            currency_info = payment_data["currency"]
-            
-            await state.update_data(
-                payment_uuid=payment_uuid,
-                stars_amount=stars,
-                user_id=callback.from_user.id,
-                timestamp=datetime.now().isoformat(),
-                expiry_date=expiry_date.isoformat()
-            )
-            
-            keyboard = types.InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [types.InlineKeyboardButton(
-                        text="💳 Оплатить", 
-                        url=payment_link
-                    )],
-                    [types.InlineKeyboardButton(
-                        text="🔄 Проверить оплату",
-                        callback_data=f"check_payment:{payment_uuid}"
-                    )]
-                ]
-            )
-            
-            message_text = (
-                f"🌟 Заказ на {stars} звезд создан!\n\n"
-                f"💰 Сумма к оплате: ${amount}\n"
-                f"💱 Валюта: {currency_info['name']} ({currency_info['fullcode']})\n"
-                f"⏳ Действителен до: {expiry_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-                "⚠️ После оплаты нажмите 'Проверить оплату'"
-            )
-            
-            await callback.message.edit_text(
-                message_text,
-                reply_markup=keyboard
-            )
-            
-        else:
-            raise Exception("Failed to create invoice")
-            
+        await callback.message.answer(
+            "✅ Ваша заявка на покупку отправлена на проверку!\n"
+            "Ожидайте подтверждения от администратора."
+        )
+        await state.clear()
+        
     except Exception as e:
-        logger.error(f"Error creating payment: {e}")
+        print(f"Error in check_payment: {e}")
+        await callback.message.answer("Произошла ошибка при обработке платежа. Попробуйте позже.")
+        await state.clear()
+
+@router.callback_query(F.data.startswith("approve_payment_"))
+async def approve_payment(callback: CallbackQuery):
+    try:
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("У вас нет прав для этого действия!", show_alert=True)
+            return
+            
+        order_id = int(callback.data.split("_")[2])
+        order = db.get_order(order_id)
+        
+        if not order:
+            await callback.answer("Заказ не найден!", show_alert=True)
+            return
+            
+        if order['status'] != "pending":
+            await callback.answer("Этот заказ уже обработан!", show_alert=True)
+            return
+        
+        db.update_order_status(order_id, "completed")
+        user = db.get_user(str(order['user_id']))
+        
+        if user:
+            db.update_user_balance(str(user['telegram_id']), order['amount_star'])
+            try:
+                await callback.bot.send_message(
+                    user['telegram_id'],
+                    f"✅ Ваш заказ на {order['amount_star']} звезд подтвержден!\n"
+                    f"Звезды зачислены на ваш баланс."
+                )
+            except Exception as e:
+                print(f"Failed to notify user {user['telegram_id']}: {e}")
+        
         await callback.message.edit_text(
-            "❌ Произошла ошибка при создании платежа. Попробуйте позже."
+            callback.message.text + "\n\n✅ Оплата подтверждена",
+            reply_markup=None
         )
-
-@router.callback_query(F.data.startswith("check_payment:"))
-async def check_payment_status(callback: types.CallbackQuery, state: FSMContext):
-    """Проверяет статус оплаты"""
-    payment_uuid = callback.data.split(":")[1]
-    
-    try:
-        url = "https://api.cryptocloud.plus/v2/invoice/info"
-        headers = {
-            "Authorization": f"Token {API_KEY}"
-        }
-        params = {
-            "uuid": payment_uuid
-        }
-
-        response = requests.get(url, headers=headers, params=params)
-        result = response.json()
-
-        if response.status_code == 200 and result.get("status") == "success":
-            payment_data = result["result"]
-            payment_status = payment_data["status"]
-            
-            if payment_status == "paid":
-                # Здесь можно добавить логику начисления звезд
-                await callback.message.edit_text(
-                    "✅ Оплата успешно проведена!\n"
-                    "Звезды начислены на ваш баланс.",
-                    reply_markup=None
-                )
-            elif payment_status == "expired":
-                await callback.message.edit_text(
-                    "❌ Время оплаты истекло.\n"
-                    "Пожалуйста, создайте новый заказ.",
-                    reply_markup=None
-                )
-            else:
-                await callback.answer(
-                    "❌ Оплата еще не поступила. Попробуйте позже.",
-                    show_alert=True
-                )
-        else:
-            raise Exception("Failed to check payment status")
         
     except Exception as e:
-        logger.error(f"Error checking payment: {e}")
-        await callback.answer(
-            "❌ Произошла ошибка при проверке оплаты. Попробуйте позже.",
-            show_alert=True
+        print(f"Error in approve_payment: {e}")
+        await callback.answer("Произошла ошибка при подтверждении платежа", show_alert=True)
+
+@router.callback_query(F.data.startswith("reject_payment_"))
+async def reject_payment(callback: CallbackQuery):
+    try:
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("У вас нет прав для этого действия!", show_alert=True)
+            return
+            
+        order_id = int(callback.data.split("_")[2])
+        order = db.get_order(order_id)
+        
+        if not order:
+            await callback.answer("Заказ не найден!", show_alert=True)
+            return
+            
+        if order['status'] != "pending":
+            await callback.answer("Этот заказ уже обработан!", show_alert=True)
+            return
+        
+        db.update_order_status(order_id, "rejected")
+        
+        try:
+            await callback.bot.send_message(
+                order['user_id'],
+                f"❌ Ваш заказ на {order['amount_star']} звезд отклонен.\n"
+                f"Пожалуйста, проверьте правильность оплаты или обратитесь к администратору."
+            )
+        except Exception as e:
+            print(f"Failed to notify user {order['user_id']}: {e}")
+        
+        await callback.message.edit_text(
+            callback.message.text + "\n\n❌ Оплата отклонена",
+            reply_markup=None
         )
+        
+    except Exception as e:
+        print(f"Error in reject_payment: {e}")
+        await callback.answer("Произошла ошибка при отклонении платежа", show_alert=True)

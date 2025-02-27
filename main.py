@@ -12,7 +12,6 @@ from middlewares.work_set import WorkSetMiddleware
 
 from handlers.main_handler import router as main_router
 from handlers.functions.shop_handler import router as shop_router
-from data.models import async_main
 load_dotenv()
 
 default_setting = DefaultBotProperties(parse_mode='HTML')
@@ -20,8 +19,6 @@ bot = Bot(os.getenv("BOT_TOKEN"), default=default_setting)
 dp = Dispatcher()
 
 async def main() -> None:
-    await async_main()
-    
     dp.message.middleware(PrivateChatMiddleware())
     # dp.message.middleware(AntiFloodMiddleware(limit=0.5))
     dp.message.middleware(WorkSetMiddleware())
