@@ -1,17 +1,35 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 def main_menu_inline():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👤 Личный профиль", callback_data="profile")],
-        [InlineKeyboardButton(text="🆘 Техподдержка", callback_data="support")],
-        [InlineKeyboardButton(text="✅ Наши гарантии", callback_data="guarantees")],
-        [InlineKeyboardButton(text="⭐️ Отзывы клиентов", callback_data="reviews")],
         [InlineKeyboardButton(text="💰 Купить звезды", callback_data="buy_stars")],
+        [
+            InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral_system"),
+            InlineKeyboardButton(text="🎁 Активировать промокод (СКОРО)", callback_data="promocode")
+        ],
+        [InlineKeyboardButton(text="⭐️ Отзывы клиентов", url="https://t.me/arastars1")]
     ])
 
 def get_profile_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral_system")],
-        [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="delete_account")],
+        [
+            InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral_system"),
+            InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="delete_account")
+        ],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="to_home_menu")]
     ])
+    
+
+def get_help_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="❓ FAQ"),
+                KeyboardButton(text="🆘 Поддержка")
+            ],
+            [
+                KeyboardButton(text="🏠 На главную")
+            ]
+        ],
+        resize_keyboard=True
+    )

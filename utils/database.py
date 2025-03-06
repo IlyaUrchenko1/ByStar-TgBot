@@ -87,6 +87,13 @@ class Database:
         self.connection.commit()
         return self.cursor.rowcount > 0
       
+    def amount_refferal_by_tg_id(self, telegram_id: str) -> int:
+        self.ensure_connection()
+        self.cursor.execute("SELECT referral_telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
+        referral_telegram_id = self.cursor.fetchone()
+        return referral_telegram_id[0] if referral_telegram_id else None
+      
+      
     #endregion
 
     #region Promocodes

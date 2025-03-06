@@ -12,6 +12,10 @@ from middlewares.work_set import WorkSetMiddleware
 
 from handlers.main_handler import router as main_router
 from handlers.functions.shop_handler import router as shop_router
+from handlers.functions.faq_handler import router as faq_router
+from handlers.functions.support_handler import router as support_router
+from handlers.functions.referral_system_handler import router as referral_router
+
 load_dotenv()
 
 default_setting = DefaultBotProperties(parse_mode='HTML')
@@ -21,10 +25,14 @@ dp = Dispatcher()
 async def main() -> None:
     dp.message.middleware(PrivateChatMiddleware())
     # dp.message.middleware(AntiFloodMiddleware(limit=0.5))
-    dp.message.middleware(WorkSetMiddleware())
+    # dp.message.middleware(WorkSetMiddleware())
     
     dp.include_router(main_router)
     dp.include_router(shop_router)
+    dp.include_router(faq_router)
+    dp.include_router(support_router)
+    dp.include_router(referral_router)
+    
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, skip_updates=True)

@@ -1,9 +1,8 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
-from keyboards.user_keyboards import main_menu_inline
+from aiogram.types import Message, CallbackQuery, FSInputFile
+from keyboards.user_keyboards import main_menu_inline, get_help_menu
 from keyboards.admin_keyboards import get_admin_menu
 from utils.constants import ADMIN_IDS
 from utils.database import Database
@@ -11,29 +10,15 @@ from utils.database import Database
 router = Router(name='main')
 db = Database()
 
-class FilterStates(StatesGroup):
-    waiting_for_filter = State()
-    waiting_for_field_input = State()
-
 @router.message(CommandStart())
 async def start_command(message: Message, state: FSMContext):
     telegram_id = str(message.from_user.id)
+    referral_id = message.text.split()[1] if len(message.text.split()) > 1 else None
     
-    # Get referral ID from command arguments
-    args = message.text.split()
-    referral_id = args[1] if len(args) > 1 else None
-    
-    user = db.get_user(telegram_id)
+    user = db.get_user(telegram_id) or db.create_user(telegram_id, referral_id)
     if not user:
-        try:
-            user = db.create_user(telegram_id, referral_id)
-        except Exception as e:
-            print(f"Error creating user: {e}")
-            await message.answer(
-                "❌ Произошла ошибка при создании профиля. Попробуйте позже.",
-                reply_markup=main_menu_inline()
-            )
-            return
+        await message.answer("❌ Ошибка при создании профиля", reply_markup=main_menu_inline())
+        return
 
     await open_home(message, message.from_user, state)
 
@@ -47,41 +32,28 @@ async def go_to_home_reply(message: Message, state: FSMContext):
     await open_home(message, message.from_user, state)
 
 async def open_home(message: Message, user, state: FSMContext, is_callback: bool = False):
-    try:
-        await state.clear()
+    await state.clear()
+    
+    db_user = db.get_user(str(user.id)) or db.create_user(str(user.id))
+    if not db_user:
+        await message.answer("❌ Ошибка получения данных. Используйте /start")
+        return
+
+    if user.id in ADMIN_IDS:
+        await message.answer("Админ панель:", reply_markup=get_admin_menu())
         
-        db_user = db.get_user(str(user.id))
-        if not db_user:
-            try:
-                db_user = db.create_user(str(user.id))
-                if not db_user:
-                    raise Exception("Failed to create user")
-            except Exception as e:
-                error_text = "❌ Ошибка получения данных. Используйте /start для перезапуска"
-                await send_message(message, error_text, is_callback)
-                return
-
-        if user.id in ADMIN_IDS:
-            await message.answer(
-                "🌟 Админ панель:\n",
-                reply_markup=get_admin_menu()
-            )
-            
-        await message.answer("🏠 Главное меню", reply_markup=main_menu_inline())
-
-    except Exception as e:
-        print(f"Error in open_home: {e}")
-        error_text = "❌ Произошла ошибка. Используйте /start для перезапуска"
-        await send_message(message, error_text, is_callback)
-
-async def send_message(message: Message, text: str, is_callback: bool):
-    if is_callback:
-        try:
-            await message.edit_text(text, reply_markup=main_menu_inline())
-        except:
-            await message.answer(text, reply_markup=main_menu_inline())
-    else:
-        await message.answer(text, reply_markup=main_menu_inline())
+    await message.answer("🔄 Загрузка данных...", reply_markup=get_help_menu())
+    try:
+        await message.answer_photo(
+            FSInputFile("./images/logo_for_start.jpg"), 
+            caption="🏠 Главное меню", 
+            reply_markup=main_menu_inline()
+        )
+    except FileNotFoundError:
+        await message.answer(
+            "🏠 Главное меню",
+            reply_markup=main_menu_inline()
+        )
 
 @router.message(F.text == "/get_id")
 async def get_id(message: Message):
