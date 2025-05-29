@@ -4,8 +4,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
-from utils.constants import STAR_TO_RUBLE, ADMIN_IDS
+from utils.constants import STAR_TO_RUBLE, ADMIN_IDS, ALLOWED_TO_ADMIN_PANEL_IDS
 from utils.database import Database
+import os
+import hmac
+import json
+import hashlib
+import requests
+import uuid
+from datetime import datetime
 
 router = Router(name='shop')
 db = Database()
@@ -151,23 +158,145 @@ async def process_stars_amount(message: Message, state: FSMContext):
         
         await state.update_data(stars=stars, rubles=rubles)
         
+        # Создаем уникальный ID заказа
+        order_id = f"order_{message.from_user.id}_{int(datetime.now().timestamp())}"
+        await state.update_data(order_id=order_id)
+        
+        # Показываем пользователю варианты оплаты
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Подтвердить оплату ✅", callback_data="check_payment")]
+            [InlineKeyboardButton(text="💳 Оплатить по СБП", callback_data="pay_sbp")],
+            [InlineKeyboardButton(text="💰 Оплатить переводом на карту", callback_data="pay_card")]
         ])
         
         await message.answer(
             f"💰 Сумма к оплате: {rubles} RUB\n"
-            f"👤 Получатель: @{target_username}\n\n{PAYMENT_DETAILS}\n\n"
-            f"✅ После совершения оплаты нажмите кнопку «Подтвердить оплату»",
+            f"👤 Получатель: @{target_username}\n\n"
+            f"Выберите способ оплаты:",
             reply_markup=keyboard
         )
-        await state.set_state(ShopStates.waiting_for_payment)
         
     except ValueError:
         await message.answer("❌ Пожалуйста, введите корректное число звезд.")
     except Exception as e:
         print(f"Error in process_stars_amount: {e}")
         await message.answer("❌ Произошла ошибка. Попробуйте позже.")
+
+@router.callback_query(F.data == "pay_sbp")
+async def pay_with_sbp(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        
+        data = await state.get_data()
+        stars = data.get('stars')
+        rubles = data.get('rubles')
+        target_username = data.get('target_username')
+        order_id = data.get('order_id')
+        
+        if not stars or not rubles or not target_username or not order_id:
+            await callback.message.answer("❌ Произошла ошибка. Пожалуйста, начните покупку заново.")
+            await state.clear()
+            return
+        
+        # Получаем данные для Lava Pay из .env
+        secret_key = os.getenv("LAVA_SECRET_KEY", "51372c3ef4b5bcefb07c3d0237675258f9088a1a")
+        shop_id = os.getenv("LAVA_SHOP_ID", "e9a3cee7-e740-4422-a0c1-4fba8f7652b9")
+        
+        # Создаем данные для запроса
+        payment_data = {
+            "sum": rubles,
+            "orderId": order_id,
+            "shopId": shop_id,
+            "comment": f"Покупка {stars} звезд для @{target_username}"
+        }
+        
+        # Сериализуем данные в JSON
+        json_str = json.dumps(payment_data)
+        json_bytes = json_str.encode()
+        
+        # Создаем подпись
+        sign = hmac.new(
+            bytes(secret_key, 'UTF-8'),
+            json_bytes,
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Отправляем запрос в Lava API
+        headers = {
+            'Signature': sign,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(
+            'https://api.lava.ru/business/invoice/create',
+            data=json_bytes,
+            headers=headers
+        )
+        
+        response_data = response.json()
+        print(f"Lava API response: {response_data}")
+        
+        if response.status_code == 200 and response_data.get('status_check'):
+            payment_url = response_data.get('data', {}).get('url')
+            
+            await state.update_data(payment_method="СБП (Lava Pay)")
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)],
+                [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data="check_payment")]
+            ])
+            
+            await callback.message.answer(
+                f"💰 Сумма к оплате: {rubles} RUB\n"
+                f"👤 Получатель: @{target_username}\n\n"
+                f"Для оплаты через СБП нажмите кнопку «Оплатить»\n\n"
+                f"✅ После совершения оплаты нажмите кнопку «Я оплатил(а)»",
+                reply_markup=keyboard
+            )
+            
+            await state.set_state(ShopStates.waiting_for_payment)
+        else:
+            print(f"Lava API error: {response_data}")
+            await callback.message.answer(
+                "❌ Произошла ошибка при создании платежа через СБП. Пожалуйста, выберите другой способ оплаты."
+            )
+    except Exception as e:
+        print(f"Error in pay_with_sbp: {e}")
+        await callback.message.answer("❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+@router.callback_query(F.data == "pay_card")
+async def pay_with_card(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        
+        data = await state.get_data()
+        stars = data.get('stars')
+        rubles = data.get('rubles')
+        target_username = data.get('target_username')
+        
+        if not stars or not rubles or not target_username:
+            await callback.message.answer("❌ Произошла ошибка. Пожалуйста, начните покупку заново.")
+            await state.clear()
+            return
+        
+        await state.update_data(payment_method="Перевод на карту")
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data="check_payment")]
+        ])
+        
+        await callback.message.answer(
+            f"💰 Сумма к оплате: {rubles} RUB\n"
+            f"👤 Получатель: @{target_username}\n\n{PAYMENT_DETAILS}\n\n"
+            f"✅ После совершения оплаты нажмите кнопку «Я оплатил(а)»",
+            reply_markup=keyboard
+        )
+        
+        await state.set_state(ShopStates.waiting_for_payment)
+        
+    except Exception as e:
+        print(f"Error in pay_with_card: {e}")
+        await callback.message.answer("❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
 
 @router.callback_query(ShopStates.waiting_for_payment, F.data == "check_payment")
 async def check_payment(callback: CallbackQuery, state: FSMContext):
@@ -178,6 +307,8 @@ async def check_payment(callback: CallbackQuery, state: FSMContext):
         stars = data.get('stars')
         rubles = data.get('rubles')
         target_username = data.get('target_username')
+        order_id = data.get('order_id')
+        payment_method = data.get('payment_method', "Не указан")
         
         if not stars or not rubles or not target_username:
             await callback.message.answer("❌ Произошла ошибка. Пожалуйста, начните покупку заново.")
@@ -192,12 +323,12 @@ async def check_payment(callback: CallbackQuery, state: FSMContext):
             await state.clear()
             return
             
-        order_id = db.create_order(user['id'], stars, rubles, "pending")
+        db_order_id = db.create_order(user['id'], stars, rubles, "pending")
         
         admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="Подтвердить ✅", callback_data=f"approve_payment_{order_id}_{target_username}_{user_id}"),
-                InlineKeyboardButton(text="Отклонить ❌", callback_data=f"reject_payment_{order_id}_{user_id}")
+                InlineKeyboardButton(text="Подтвердить ✅", callback_data=f"approve_payment_{db_order_id}_{target_username}_{user_id}"),
+                InlineKeyboardButton(text="Отклонить ❌", callback_data=f"reject_payment_{db_order_id}_{user_id}")
             ],
             [InlineKeyboardButton(text="Профиль пользователя 👤", url=f"tg://user?id={user_id}")]
         ])
@@ -209,7 +340,9 @@ async def check_payment(callback: CallbackQuery, state: FSMContext):
             f"📝 Username заказчика: @{callback.from_user.username}\n"
             f"📝 Username получателя: @{target_username}\n"
             f"⭐️ Количество звезд: {stars}\n"
-            f"💰 Сумма: {rubles} RUB"
+            f"💰 Сумма: {rubles} RUB\n"
+            f"💳 Способ оплаты: {payment_method}\n"
+            f"🧾 ID заказа: {order_id}"
         )
         
         for admin_id in ADMIN_IDS:
@@ -238,12 +371,10 @@ async def check_payment(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("approve_payment_"))
 async def approve_payment(callback: CallbackQuery):
     try:
-        # Проверка прав администратора
-        if not callback.from_user or callback.from_user.id not in ADMIN_IDS:
+        if not callback.from_user or callback.from_user.id not in ALLOWED_TO_ADMIN_PANEL_IDS:
             await callback.answer("⛔️ У вас нет прав для этого действия!", show_alert=True)
             return
             
-        # Парсинг и валидация данных из callback
         try:
             callback_parts = callback.data.split("_")
             if len(callback_parts) != 5:
@@ -261,7 +392,6 @@ async def approve_payment(callback: CallbackQuery):
             await callback.answer("❌ Некорректные данные запроса", show_alert=True)
             return
             
-        # Проверка заказа
         order = db.get_order(order_id)
         if not order:
             await callback.answer("❌ Заказ не найден!", show_alert=True)
@@ -275,97 +405,34 @@ async def approve_payment(callback: CallbackQuery):
             await callback.answer("❌ Некорректное количество звезд в заказе", show_alert=True)
             return
         
-        # Обновление статуса заказа
         if not db.update_order_status(order_id, "completed"):
             await callback.answer("❌ Ошибка при обновлении статуса заказа", show_alert=True)
             return
 
-        # Отправка начального уведомления пользователю
         try:
             await callback.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ Ваш заказ на {order['amount_star']} Telegram звезд для @{username} принят!\n"
                      f"⏳ Звезды будут зачислены в течение нескольких минут."
             )
+            
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n✅ Оплата подтверждена\n⭐️ Звезды будут зачислены вручную",
+                reply_markup=None
+            )
+            
         except Exception as e:
-            print(f"Failed to send initial notification to user {user_id}: {e}")
+            print(f"Failed to send notification to user {user_id}: {e}")
             await callback.answer("⚠️ Не удалось отправить уведомление пользователю", show_alert=True)
 
-        # Обработка покупки звезд через API
-        try:
-            import aiohttp
-            import os
-            
-            api_key = os.getenv('STAR_SOV_API_KEY')
-            api_url = os.getenv('URL_SEND_PAID_STAR_SOV')
-            
-            if not api_key or not api_url:
-                raise ValueError("Missing API configuration")
-            
-            async with aiohttp.ClientSession() as session:
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-                data = {
-                    "Username": username,  # Используем username получателя
-                    "Quantity": order['amount_star']
-                }
-                
-                async with session.post(api_url, 
-                                      headers=headers, 
-                                      json=data,
-                                      timeout=30) as response:
-                    response_text = await response.text()
-                    
-                    if response.status == 200:
-                        # Обновление баланса пользователя
-                        if not db.update_user_balance(user_id, order['amount_star']):
-                            raise Exception("Failed to update user balance")
-                            
-                        # Отправка уведомления об успехе
-                        await callback.bot.send_message(
-                            chat_id=user_id,
-                            text=f"🌟 Поздравляем! {order['amount_star']} Telegram звезд успешно зачислены для @{username}!\n"
-                                 f"💫 Спасибо за покупку! Желаем приятного использования.\n"
-                                 f"🎁 Будем рады видеть вас снова!"
-                        )
-                    else:
-                        await callback.bot.send_message(
-                            chat_id=user_id,
-                            text=f"⚠️ Произошла техническая ошибка при зачислении звезд.\n"
-                                 f"👨‍💻 Пожалуйста, обратитесь к администратору @admin"
-                        )
-                        print(f"Star purchase API error: {response_text}")
-                        raise Exception(f"API returned status {response.status}: {response_text}")
-        
-            # Обновление сообщения администратора
-            try:
-                await callback.message.edit_text(
-                    f"{callback.message.text}\n\n✅ Оплата подтверждена и обработана",
-                    reply_markup=None
-                )
-            except Exception as e:
-                print(f"Failed to update admin message: {e}")
-            
-        except aiohttp.ClientError as e:
-            print(f"API connection error: {e}")
-            db.update_order_status(order_id, "error")
-            await callback.answer("❌ Ошибка соединения с сервером звезд", show_alert=True)
-            
-        except Exception as e:
-            print(f"Error processing stars: {e}")
-            db.update_order_status(order_id, "error")
-            await callback.answer("❌ Произошла ошибка при зачислении звезд", show_alert=True)
-        
     except Exception as e:
         print(f"Error in approve_payment: {e}")
-        await callback.answer("❌ Произошла ошибка при подтверждении платежа", show_alert=True)
+        await callback.answer("❌ Произошла ошибка при обработке платежа", show_alert=True)
 
 @router.callback_query(F.data.startswith("reject_payment_"))
 async def reject_payment(callback: CallbackQuery):
     try:
-        if callback.from_user.id not in ADMIN_IDS:
+        if callback.from_user.id not in ALLOWED_TO_ADMIN_PANEL_IDS:
             await callback.answer("⛔️ У вас нет прав для этого действия!", show_alert=True)
             return
             
